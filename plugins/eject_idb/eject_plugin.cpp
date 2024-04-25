@@ -1,17 +1,79 @@
 // Eject IDB by Elias Bachaalany(c) AllThingsIDA
 
+#include <thread>
+#include <functional>
+#include <string>
+#include <memory>
+
+#ifdef __NT__
+    #include <windows.h>
+#endif
+
 #include <ida.hpp>
 #include <idp.hpp>
 #include <loader.hpp>
 #include <kernwin.hpp>
 
-// Edit the EJECTIDB_HOTKEY_xxx constants to change the hotkey and modifiers
-#include "windowthreadhotkey.h"
+#include "utils.hpp"
+
+class semaphore_helper_t 
+{
+private:
+    std::thread thread_;
+    std::string sem_name_;
+    qsemaphore_t sem_;
+    std::function<void()> callback_;
+    bool should_exit_;
+
+public:
+    semaphore_helper_t(const char* sem_name, std::function<void()> callback)
+        : sem_name_(sem_name), callback_(callback), sem_(nullptr), should_exit_(false) { }
+
+    ~semaphore_helper_t() {
+        stop();
+    }
+
+    void start() 
+    {
+        sem_ = qsem_create(sem_name_.c_str(), 0);
+        if (sem_ == nullptr)
+            return;
+
+        thread_ = std::thread([this]() 
+        {
+            while (qsem_wait(sem_, -1)) 
+            {
+                if (should_exit_)
+                    break;
+                callback_();
+            }
+        });
+    }
+
+    void signal() 
+    {
+        if (sem_ != nullptr) 
+            qsem_post(sem_);
+    }
+
+    void stop() 
+    {
+        if (sem_ != nullptr) 
+        {
+            should_exit_ = true;
+            qsem_post(sem_);
+            thread_.join();
+            qsem_free(sem_);
+            sem_ = nullptr;
+        }
+    }
+};
 
 //--------------------------------------------------------------------------
 struct plugin_ctx_t : public plugmod_t
 {
-    CWindowThreadHotkey w;
+    std::unique_ptr<semaphore_helper_t> sem_helper;
+
     bool disable_ui = false;
     static ssize_t idaapi ui_callback(void* ud, int notification_code, va_list va)
     {
@@ -19,35 +81,38 @@ struct plugin_ctx_t : public plugmod_t
         return ctx->disable_ui ? 1 : 0;
     }
 
-    plugin_ctx_t() 
+    void do_eject()
     {
-        w.Start();
-        msg("eject_idb installed. press Ctrl-Alt-E to eject the IDB when IDA UI enters an infinite loop!\n");
-        hook_to_notification_point(HT_UI, ui_callback, this);
+        qstring p = get_idb_path();
+        auto idx = p.rfind('.');
+        if (idx == qstring::npos)
+            return;
+
+        // unfortunately, `save_database` calls the main thread/UI to display success/failure messages
+        // thus, before 'ejecting', let's all UI messages
+        disable_ui = true;
+        flush_buffers();
+        qstring new_name = p.substr(0, idx) + ".ejected" + p.substr(idx);
+        save_database(new_name.c_str(), DBFL_BAK);
+        // Now it is safe to kill IDA.
+#ifdef __NT__
+        if (MessageBoxW(NULL, L"IDB has been ejected. Do you want to forcefully exit IDA?", L"eject_idb", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+            ExitProcess(0);
+#endif
+        disable_ui = false;
     }
 
-    // This hanging mode (or an equivalent 'for (;;) {}') cannot be 'ejected'
-    static void hang_with_event()
+    plugin_ctx_t() 
     {
-        // Create an unsignaled, manual-reset event
-        HANDLE hEvent = CreateEvent(
-            NULL,   // default security attributes
-            TRUE,   // manual-reset event
-            FALSE,  // initial state is nonsignaled
-            NULL    // object name (optional)
-        );
+        char sem_name[64];
+        make_semaphore_name(get_idb_path().c_str(), sem_name, sizeof(sem_name));
+        sem_helper.reset(
+            new semaphore_helper_t(sem_name, std::bind(&plugin_ctx_t::do_eject, this)));
+        sem_helper->start();
 
-        if (hEvent == NULL)
-        {
-            // Handle error
-            msg("CreateEvent failed with error: %d\n", GetLastError());
-            return;
-        }
-
-        // Wait for the event to be signaled
-        WaitForSingleObject(hEvent, INFINITE);
-        // Close the event handle
-        CloseHandle(hEvent);
+        msg("eject_idb installed. call the 'eject_idb \"%s\"' command line tool to eject this database!\n",
+            get_idb_path().c_str());
+        hook_to_notification_point(HT_UI, ui_callback, this);
     }
 
     // This hanging mode (only if poll is true) can be 'ejected'
@@ -60,23 +125,19 @@ struct plugin_ctx_t : public plugmod_t
             qsleep(1000);
         }
         return true;
-	}
+    }
 
     bool idaapi run(size_t arg) override
     {
         switch (arg)
         {
             case 0:
-                if (ask_yn(1, "HIDECANCEL\nDo you want to simulate a responsive UI hang?") == ASKBTN_YES)
-                    hang_with_loop(true);
-                break;
-            case 1:
                 if (ask_yn(1, "HIDECANCEL\nDo you want to simulate a non-responsive UI hang?") == ASKBTN_YES)
                     hang_with_loop(false);
                 break;
-            case 2:
-                if (ask_yn(1, "HIDECANCEL\nDo you want to simulate a non-responsive UI hang with WaitForSingleObject?") == ASKBTN_YES)
-                    hang_with_event();
+            case 1:
+                if (ask_yn(1, "HIDECANCEL\nDo you want to simulate a responsive UI hang?") == ASKBTN_YES)
+                    hang_with_loop(true);
                 break;
         }
         return true;
@@ -84,43 +145,21 @@ struct plugin_ctx_t : public plugmod_t
 
     ~plugin_ctx_t() override
     {
+        //;! use on_event/modern
         unhook_from_notification_point(HT_UI, ui_callback, this);
-		w.Stop();
-	}
+    }
 };
-
-plugin_ctx_t* plugin;
-
-//--------------------------------------------------------------------------
-extern "C" void do_eject()
-{
-    qstring p = get_path(PATH_TYPE_IDB);
-    auto idx = p.rfind('.');
-    if (idx == qstring::npos)
-        return;
-
-    // unfortunately, `save_database` calls the main thread/UI to display success/failure messages
-    // thus, before 'ejecting', let's all UI messages
-    plugin->disable_ui = true;
-    flush_buffers();
-    qstring new_name = p.substr(0, idx) + ".ejected" + p.substr(idx);
-    save_database(new_name.c_str(), DBFL_BAK);
-    // Now it is safe to kill IDA.
-    if (MessageBoxW(NULL, L"IDB has been ejected. Do you want to forcefully exit IDA?", L"eject_idb", MB_YESNO | MB_ICONINFORMATION) == IDYES)
-		ExitProcess(0);
-    plugin->disable_ui = false;
-}
 
 //--------------------------------------------------------------------------
 plugin_t PLUGIN =
 {
     IDP_INTERFACE_VERSION,
-    PLUGIN_FIX | PLUGIN_MULTI,
-    []()->plugmod_t* { return plugin = new plugin_ctx_t; }, // initialize
+    PLUGIN_MULTI,
+    []()->plugmod_t* { return new plugin_ctx_t; }, // initialize
     nullptr,
     nullptr,
     nullptr,
     nullptr,
-    "eject_idb: simulate UI infinite loop",
+    "eject_idb: simulate an infinite loop",
     nullptr
 };
